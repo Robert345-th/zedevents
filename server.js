@@ -23,6 +23,7 @@ router.get('/', async (req, res) => {
   try {
     let query = `
       SELECT s.id, s.title, s.description, s.price, s.photos, s.date_posted, s.vendor_id,
+             s.latitude, s.longitude, s.location_label,
              c.name AS category, u.name AS vendor_name, u.business_name, u.business_photo_url
       FROM services s
       LEFT JOIN categories c ON s.category_id = c.id
@@ -72,6 +73,7 @@ router.get('/:id', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT s.id, s.title, s.description, s.price, s.photos, s.date_posted, s.category_id, s.vendor_id,
+              s.latitude, s.longitude, s.location_label,
               c.name AS category, u.name AS vendor_name, u.phone AS vendor_phone,
               u.business_name, u.business_bio, u.business_photo_url
        FROM services s
@@ -94,7 +96,7 @@ router.get('/:id', async (req, res) => {
 
 // POST - create a new service listing (must be a vendor)
 router.post('/', requireAuth, async (req, res) => {
-  const { title, description, price, category_id, photos } = req.body;
+  const { title, description, price, category_id, photos, latitude, longitude, location_label } = req.body;
 
   if (!title || !title.trim()) {
     return res.status(400).json({ error: 'Title is required.' });
@@ -108,10 +110,10 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO services (vendor_id, title, description, price, category_id, photos)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO services (vendor_id, title, description, price, category_id, photos, latitude, longitude, location_label)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [req.userId, title.trim(), description || null, price || null, category_id || null, photos || []]
+      [req.userId, title.trim(), description || null, price || null, category_id || null, photos || [], latitude || null, longitude || null, location_label || null]
     );
 
     res.status(201).json(result.rows[0]);
@@ -123,7 +125,7 @@ router.post('/', requireAuth, async (req, res) => {
 
 // PUT - edit a service (owner only)
 router.put('/:id', requireAuth, async (req, res) => {
-  const { title, description, price, category_id, photos } = req.body;
+  const { title, description, price, category_id, photos, latitude, longitude, location_label } = req.body;
 
   try {
     const check = await pool.query('SELECT vendor_id FROM services WHERE id = $1', [req.params.id]);
@@ -137,8 +139,10 @@ router.put('/:id', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `UPDATE services SET title = $1, description = $2, price = $3, category_id = $4, photos = $5 WHERE id = $6 RETURNING *`,
-      [title, description, price, category_id, photos || [], req.params.id]
+      `UPDATE services SET title = $1, description = $2, price = $3, category_id = $4, photos = $5,
+              latitude = $6, longitude = $7, location_label = $8
+       WHERE id = $9 RETURNING *`,
+      [title, description, price, category_id, photos || [], latitude || null, longitude || null, location_label || null, req.params.id]
     );
 
     res.json(result.rows[0]);
