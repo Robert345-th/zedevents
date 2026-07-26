@@ -22,6 +22,26 @@ function toIntlPhone(phone) {
   return phone.startsWith('0') ? '+260' + phone.slice(1) : phone;
 }
 
+function generateReferralCodeCandidate() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+async function generateUniqueReferralCode() {
+  let code;
+  let exists = true;
+  while (exists) {
+    code = generateReferralCodeCandidate();
+    const check = await pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code]);
+    exists = check.rows.length > 0;
+  }
+  return code;
+}
+
 async function checkOtpLimit(userId) {
   const result = await pool.query(
     'SELECT otp_send_count, otp_window_start FROM users WHERE id = $1',
@@ -47,9 +67,9 @@ async function checkOtpLimit(userId) {
   return { allowed: true };
 }
 
-// SIGNUP - name, phone, password only. Everyone starts as a regular customer.
+// SIGNUP - name, phone, password, and optional referral code
 router.post('/signup', async (req, res) => {
-  const { name, phone, password, confirmPassword } = req.body;
+  const { name, phone, password, confirmPassword, referral_code } = req.body;
 
   if (!name || !phone || !password || !confirmPassword) {
     return res.status(400).json({ error: 'All fields are required.' });
@@ -60,6 +80,15 @@ router.post('/signup', async (req, res) => {
   }
 
   try {
+    let referrerId = null;
+    if (referral_code && referral_code.trim()) {
+      const referrerCheck = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referral_code.trim().toUpperCase()]);
+      if (referrerCheck.rows.length === 0) {
+        return res.status(400).json({ error: 'That referral code was not found.' });
+      }
+      referrerId = referrerCheck.rows[0].id;
+    }
+
     const existing = await pool.query('SELECT id, phone_verified FROM users WHERE phone = $1', [phone]);
 
     const password_hash = await bcrypt.hash(password, 10);
@@ -79,15 +108,16 @@ router.post('/signup', async (req, res) => {
       }
 
       const updateResult = await pool.query(
-        `UPDATE users SET name = $1, password_hash = $2, otp_code = $3, otp_expires = $4 WHERE phone = $5 RETURNING id, name, phone`,
-        [name, password_hash, otp, expires, phone]
+        `UPDATE users SET name = $1, password_hash = $2, otp_code = $3, otp_expires = $4, referred_by = $5 WHERE phone = $6 RETURNING id, name, phone`,
+        [name, password_hash, otp, expires, referrerId, phone]
       );
       user = updateResult.rows[0];
     } else {
+      const newReferralCode = await generateUniqueReferralCode();
       const insertResult = await pool.query(
-        `INSERT INTO users (name, phone, password_hash, otp_code, otp_expires, otp_send_count, otp_window_start)
-         VALUES ($1, $2, $3, $4, $5, 1, NOW()) RETURNING id, name, phone`,
-        [name, phone, password_hash, otp, expires]
+        `INSERT INTO users (name, phone, password_hash, otp_code, otp_expires, otp_send_count, otp_window_start, referral_code, referred_by)
+         VALUES ($1, $2, $3, $4, $5, 1, NOW(), $6, $7) RETURNING id, name, phone`,
+        [name, phone, password_hash, otp, expires, newReferralCode, referrerId]
       );
       user = insertResult.rows[0];
     }
@@ -297,6 +327,12 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ error: 'Please verify your phone number first.', needsVerification: true });
     }
 
+    if (!user.referral_code) {
+      const newCode = await generateUniqueReferralCode();
+      await pool.query('UPDATE users SET referral_code = $1 WHERE id = $2', [newCode, user.id]);
+      user.referral_code = newCode;
+    }
+
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({
@@ -306,6 +342,32 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong logging in.' });
+  }
+});
+
+// GET MY REFERRAL INFO
+router.get('/referral-info', requireAuth, async (req, res) => {
+  try {
+    const userResult = await pool.query('SELECT referral_code, free_featured_credits FROM users WHERE id = $1', [req.userId]);
+
+    let referralCode = userResult.rows[0]?.referral_code;
+    if (!referralCode) {
+      referralCode = await generateUniqueReferralCode();
+      await pool.query('UPDATE users SET referral_code = $1 WHERE id = $2', [referralCode, req.userId]);
+    }
+
+    const referralsResult = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1', [req.userId]);
+    const vendorReferralsResult = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1 AND is_vendor = true', [req.userId]);
+
+    res.json({
+      referral_code: referralCode,
+      total_referrals: parseInt(referralsResult.rows[0].count),
+      vendor_referrals: parseInt(vendorReferralsResult.rows[0].count),
+      free_featured_credits: userResult.rows[0]?.free_featured_credits || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load referral info.' });
   }
 });
 
@@ -336,7 +398,8 @@ router.get('/user-info/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST - become a vendor
+// POST - become a vendor. If this person was referred, both they and their
+// referrer get a free "Featured" credit for use once paid featuring launches.
 router.post('/become-vendor', requireAuth, async (req, res) => {
   const { business_name, business_bio, business_photo_url } = req.body;
 
@@ -349,6 +412,15 @@ router.post('/become-vendor', requireAuth, async (req, res) => {
       `UPDATE users SET is_vendor = true, business_name = $1, business_bio = $2, business_photo_url = $3 WHERE id = $4`,
       [business_name.trim(), business_bio || null, business_photo_url || null, req.userId]
     );
+
+    const userResult = await pool.query('SELECT referred_by FROM users WHERE id = $1', [req.userId]);
+    const referredBy = userResult.rows[0]?.referred_by;
+
+    if (referredBy) {
+      await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [referredBy]);
+      await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [req.userId]);
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error(err);
