@@ -42,7 +42,7 @@ router.get('/conversations', requireAuth, async (req, res) => {
   }
 });
 
-// GET - messages between me and another user (excludes anything deleted for me)
+// GET - messages between me and another user
 router.get('/conversation/:otherUserId', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -60,7 +60,18 @@ router.get('/conversation/:otherUserId', requireAuth, async (req, res) => {
       [req.params.otherUserId, req.userId]
     );
 
-    res.json({ messages: result.rows });
+    const blockCheck = await pool.query(
+      `SELECT
+        EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2) AS i_blocked_them,
+        EXISTS(SELECT 1 FROM blocked_users WHERE blocker_id = $2 AND blocked_id = $1) AS they_blocked_me`,
+      [req.userId, req.params.otherUserId]
+    );
+
+    res.json({
+      messages: result.rows,
+      i_blocked_them: blockCheck.rows[0].i_blocked_them,
+      they_blocked_me: blockCheck.rows[0].they_blocked_me,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load messages.' });
@@ -80,6 +91,15 @@ router.post('/', requireAuth, async (req, res) => {
   }
 
   try {
+    const blockCheck = await pool.query(
+      `SELECT 1 FROM blocked_users WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)`,
+      [req.userId, receiver_id]
+    );
+
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: 'You cannot message this user.' });
+    }
+
     const result = await pool.query(
       `INSERT INTO messages (sender_id, receiver_id, service_id, content, photo_url, audio_url, audio_duration)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
@@ -133,7 +153,7 @@ router.put('/:id/delete-for-me', requireAuth, async (req, res) => {
   }
 });
 
-// PUT - unsend a message for everyone. Only allowed if you sent it AND it hasn't been read yet.
+// PUT - unsend a message for everyone
 router.put('/:id/delete-for-everyone', requireAuth, async (req, res) => {
   try {
     const check = await pool.query('SELECT sender_id, read_at FROM messages WHERE id = $1', [req.params.id]);
@@ -176,6 +196,31 @@ router.get('/unread-count', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load unread count.' });
+  }
+});
+
+// POST - block a user
+router.post('/block/:userId', requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO blocked_users (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [req.userId, req.params.userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not block user.' });
+  }
+});
+
+// DELETE - unblock a user
+router.delete('/block/:userId', requireAuth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2', [req.userId, req.params.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not unblock user.' });
   }
 });
 
