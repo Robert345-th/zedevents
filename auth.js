@@ -398,8 +398,7 @@ router.get('/user-info/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST - become a vendor. If this person was referred, both they and their
-// referrer get a free "Featured" credit for use once paid featuring launches.
+// POST - become a vendor
 router.post('/become-vendor', requireAuth, async (req, res) => {
   const { business_name, business_bio, business_photo_url } = req.body;
 
@@ -460,6 +459,30 @@ router.put('/vendor-profile', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not update vendor profile.' });
+  }
+});
+
+// GET MY DIGEST NOTIFICATION SETTING
+router.get('/digest-settings', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT digest_enabled FROM users WHERE id = $1', [req.userId]);
+    res.json({ digest_enabled: result.rows[0]?.digest_enabled !== false });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load digest settings.' });
+  }
+});
+
+// PUT - toggle digest notifications on/off
+router.put('/digest-settings', requireAuth, async (req, res) => {
+  const { enabled } = req.body;
+
+  try {
+    await pool.query('UPDATE users SET digest_enabled = $1 WHERE id = $2', [enabled, req.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update digest settings.' });
   }
 });
 
