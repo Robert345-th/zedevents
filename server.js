@@ -22,6 +22,9 @@ app.use('/admin', adminRoutes);
 const { router: notificationsRoutes } = require('./notifications');
 app.use('/notifications', notificationsRoutes);
 
+const userReportsRoutes = require('./user-reports');
+app.use('/user-reports', userReportsRoutes);
+
 app.get('/', (req, res) => {
   res.send('ZedEvents server is running.');
 });
