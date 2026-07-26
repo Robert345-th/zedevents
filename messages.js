@@ -14,16 +14,19 @@ router.get('/conversations', requireAuth, async (req, res) => {
          m.content AS last_message,
          m.photo_url AS last_photo_url,
          m.audio_url AS last_audio_url,
+         m.deleted_for_everyone AS last_deleted_for_everyone,
          m.sent_at AS last_sent_at,
          m.sender_id,
          (SELECT COUNT(*) FROM messages
-          WHERE receiver_id = $1 AND sender_id = other_user_id AND read_at IS NULL) AS unread_count
+          WHERE receiver_id = $1 AND sender_id = other_user_id AND read_at IS NULL
+          AND deleted_for_receiver = false AND deleted_for_everyone = false) AS unread_count
        FROM (
          SELECT
            CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END AS other_user_id,
-           content, photo_url, audio_url, sent_at, sender_id
+           content, photo_url, audio_url, deleted_for_everyone, sent_at, sender_id,
+           deleted_for_sender, deleted_for_receiver
          FROM messages
-         WHERE sender_id = $1 OR receiver_id = $1
+         WHERE (sender_id = $1 AND deleted_for_sender = false) OR (receiver_id = $1 AND deleted_for_receiver = false)
          ORDER BY sent_at DESC
        ) m
        JOIN users u ON u.id = m.other_user_id
@@ -39,13 +42,15 @@ router.get('/conversations', requireAuth, async (req, res) => {
   }
 });
 
-// GET - messages between me and another user
+// GET - messages between me and another user (excludes anything deleted for me)
 router.get('/conversation/:otherUserId', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, sender_id, receiver_id, content, photo_url, audio_url, audio_duration, sent_at, read_at
+      `SELECT id, sender_id, receiver_id, content, photo_url, audio_url, audio_duration,
+              deleted_for_everyone, sent_at, read_at
        FROM messages
-       WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
+       WHERE ((sender_id = $1 AND receiver_id = $2 AND deleted_for_sender = false)
+          OR (sender_id = $2 AND receiver_id = $1 AND deleted_for_receiver = false))
        ORDER BY sent_at ASC`,
       [req.userId, req.params.otherUserId]
     );
@@ -102,11 +107,69 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
+// PUT - delete a message just for me
+router.put('/:id/delete-for-me', requireAuth, async (req, res) => {
+  try {
+    const check = await pool.query('SELECT sender_id, receiver_id FROM messages WHERE id = $1', [req.params.id]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Message not found.' });
+    }
+
+    const msg = check.rows[0];
+
+    if (msg.sender_id === req.userId) {
+      await pool.query('UPDATE messages SET deleted_for_sender = true WHERE id = $1', [req.params.id]);
+    } else if (msg.receiver_id === req.userId) {
+      await pool.query('UPDATE messages SET deleted_for_receiver = true WHERE id = $1', [req.params.id]);
+    } else {
+      return res.status(403).json({ error: 'You are not part of this conversation.' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not delete message.' });
+  }
+});
+
+// PUT - unsend a message for everyone. Only allowed if you sent it AND it hasn't been read yet.
+router.put('/:id/delete-for-everyone', requireAuth, async (req, res) => {
+  try {
+    const check = await pool.query('SELECT sender_id, read_at FROM messages WHERE id = $1', [req.params.id]);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Message not found.' });
+    }
+
+    const msg = check.rows[0];
+
+    if (msg.sender_id !== req.userId) {
+      return res.status(403).json({ error: 'You can only unsend your own messages.' });
+    }
+
+    if (msg.read_at) {
+      return res.status(400).json({ error: 'This message has already been read and can no longer be unsent for everyone.' });
+    }
+
+    await pool.query(
+      `UPDATE messages SET deleted_for_everyone = true, content = NULL, photo_url = NULL, audio_url = NULL WHERE id = $1`,
+      [req.params.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not unsend message.' });
+  }
+});
+
 // GET - unread count
 router.get('/unread-count', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT COUNT(*) AS count FROM messages WHERE receiver_id = $1 AND read_at IS NULL',
+      `SELECT COUNT(*) AS count FROM messages
+       WHERE receiver_id = $1 AND read_at IS NULL AND deleted_for_receiver = false AND deleted_for_everyone = false`,
       [req.userId]
     );
     res.json({ count: parseInt(result.rows[0].count) });
