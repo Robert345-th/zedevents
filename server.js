@@ -28,6 +28,9 @@ app.use('/user-reports', userReportsRoutes);
 const favoritesRoutes = require('./favorites');
 app.use('/favorites', favoritesRoutes);
 
+const reviewsRoutes = require('./reviews');
+app.use('/reviews', reviewsRoutes);
+
 app.get('/', (req, res) => {
   res.send('ZedEvents server is running.');
 });
