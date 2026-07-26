@@ -309,7 +309,34 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// POST - become a vendor (no approval needed while the app is free — just fill in business details)
+// GET - basic public info about a user, for showing in a chat header
+router.get('/user-info/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, is_vendor, business_name, business_photo_url, is_admin FROM users WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      display_name: user.business_name || user.name,
+      business_photo_url: user.business_photo_url || null,
+      phone: user.phone,
+      is_vendor: user.is_vendor,
+      is_admin: user.is_admin,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load user info.' });
+  }
+});
+
+// POST - become a vendor
 router.post('/become-vendor', requireAuth, async (req, res) => {
   const { business_name, business_bio, business_photo_url } = req.body;
 
