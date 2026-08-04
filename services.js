@@ -3,6 +3,59 @@ const router = express.Router();
 const pool = require('./db');
 const requireAuth = require('./middleware');
 
+let locationColumnsReady = false;
+
+async function ensureServiceLocationColumns() {
+  if (locationColumnsReady) return;
+  await pool.query('ALTER TABLE services ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION');
+  await pool.query('ALTER TABLE services ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION');
+  await pool.query('ALTER TABLE services ADD COLUMN IF NOT EXISTS location_label TEXT');
+  locationColumnsReady = true;
+}
+
+const CITY_COORDS = {
+  lusaka: { lat: -15.3875, lng: 28.3228 },
+  ndola: { lat: -12.9682, lng: 28.6364 },
+  kitwe: { lat: -12.8024, lng: 28.2132 },
+  kabwe: { lat: -14.4419, lng: 28.4492 },
+  livingstone: { lat: -17.8419, lng: 25.8544 },
+  chipata: { lat: -13.6333, lng: 32.65 },
+  solwezi: { lat: -12.1688, lng: 26.3894 },
+  mongu: { lat: -15.2486, lng: 23.1274 },
+  kasama: { lat: -10.2129, lng: 31.1917 },
+  choma: { lat: -16.8067, lng: 26.985 },
+};
+
+function coordsFromCity(city) {
+  if (!city) return null;
+  const key = String(city).trim().toLowerCase();
+  return CITY_COORDS[key] || null;
+}
+
+async function resolveServiceLocation(userId, body) {
+  const lat = body.latitude != null ? parseFloat(body.latitude) : null;
+  const lng = body.longitude != null ? parseFloat(body.longitude) : null;
+  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+    return {
+      latitude: lat,
+      longitude: lng,
+      location_label: body.location_label?.trim() || null,
+    };
+  }
+
+  const vendor = await pool.query(
+    'SELECT city, shop_location_label, home_location_label FROM users WHERE id = $1',
+    [userId]
+  );
+  const v = vendor.rows[0];
+  const coords = coordsFromCity(v?.city);
+  return {
+    latitude: coords?.lat ?? null,
+    longitude: coords?.lng ?? null,
+    location_label: body.location_label?.trim() || v?.shop_location_label || v?.home_location_label || v?.city || null,
+  };
+}
+
 // GET - list of event categories (Catering, DJ & Sound, Tents & Chairs, etc.)
 router.get('/categories', async (req, res) => {
   try {
@@ -19,8 +72,10 @@ router.get('/', async (req, res) => {
   const { category_id } = req.query;
 
   try {
+    await ensureServiceLocationColumns();
     let query = `
       SELECT s.id, s.title, s.description, s.price, s.photos, s.date_posted, s.vendor_id,
+             s.latitude, s.longitude, s.location_label,
              c.name AS category, u.name AS vendor_name, u.business_name, u.business_photo_url
       FROM services s
       LEFT JOIN categories c ON s.category_id = c.id
@@ -67,8 +122,10 @@ router.get('/mine', requireAuth, async (req, res) => {
 // GET - single service detail (public only sees approved/active)
 router.get('/:id', async (req, res) => {
   try {
+    await ensureServiceLocationColumns();
     const result = await pool.query(
       `SELECT s.id, s.title, s.description, s.price, s.photos, s.status, s.date_posted, s.category_id, s.vendor_id,
+              s.latitude, s.longitude, s.location_label,
               c.name AS category, u.name AS vendor_name, u.phone AS vendor_phone,
               u.business_name, u.business_bio, u.business_photo_url
        FROM services s
@@ -107,13 +164,14 @@ router.get('/:id', async (req, res) => {
 
 // POST - create a new service listing (must be a vendor). Starts pending until admin approves.
 router.post('/', requireAuth, async (req, res) => {
-  const { title, description, price, category_id, photos } = req.body;
+  const { title, description, price, category_id, photos, latitude, longitude, location_label } = req.body;
 
   if (!title || !title.trim()) {
     return res.status(400).json({ error: 'Title is required.' });
   }
 
   try {
+    await ensureServiceLocationColumns();
     const userCheck = await pool.query('SELECT is_vendor, vendor_status FROM users WHERE id = $1', [req.userId]);
 
     if (!userCheck.rows[0]?.is_vendor) {
@@ -128,11 +186,23 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Your vendor application was not approved.', vendorStatus: 'rejected' });
     }
 
+    const location = await resolveServiceLocation(req.userId, { latitude, longitude, location_label });
+
     const result = await pool.query(
-      `INSERT INTO services (vendor_id, title, description, price, category_id, photos, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+      `INSERT INTO services (vendor_id, title, description, price, category_id, photos, status, latitude, longitude, location_label)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)
        RETURNING *`,
-      [req.userId, title.trim(), description || null, price || null, category_id || null, photos || []]
+      [
+        req.userId,
+        title.trim(),
+        description || null,
+        price || null,
+        category_id || null,
+        photos || [],
+        location.latitude,
+        location.longitude,
+        location.location_label,
+      ]
     );
 
     res.status(201).json(result.rows[0]);
@@ -144,9 +214,10 @@ router.post('/', requireAuth, async (req, res) => {
 
 // PUT - edit a service (owner only). Goes back to pending until re-approved.
 router.put('/:id', requireAuth, async (req, res) => {
-  const { title, description, price, category_id, photos } = req.body;
+  const { title, description, price, category_id, photos, latitude, longitude, location_label } = req.body;
 
   try {
+    await ensureServiceLocationColumns();
     const check = await pool.query('SELECT vendor_id, status FROM services WHERE id = $1', [req.params.id]);
 
     if (check.rows.length === 0) {
@@ -165,10 +236,14 @@ router.put('/:id', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Title is required.' });
     }
 
+    const location = await resolveServiceLocation(req.userId, { latitude, longitude, location_label });
+
     const result = await pool.query(
       `UPDATE services
-       SET title = $1, description = $2, price = $3, category_id = $4, photos = $5, status = 'pending'
-       WHERE id = $6
+       SET title = $1, description = $2, price = $3, category_id = $4, photos = $5,
+           latitude = COALESCE($6, latitude), longitude = COALESCE($7, longitude),
+           location_label = COALESCE($8, location_label), status = 'pending'
+       WHERE id = $9
        RETURNING *`,
       [
         String(title).trim(),
@@ -176,6 +251,9 @@ router.put('/:id', requireAuth, async (req, res) => {
         price || null,
         category_id || null,
         photos || [],
+        location.latitude,
+        location.longitude,
+        location.location_label,
         req.params.id,
       ]
     );
