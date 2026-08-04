@@ -398,7 +398,140 @@ router.get('/user-info/:id', requireAuth, async (req, res) => {
   }
 });
 
-// POST - become a vendor
+// Ensure shop-registration columns exist (same fields as ZedMarket register-shop).
+async function ensureVendorColumns() {
+  const statements = [
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS city TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS province TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS selling_type TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_address TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS home_address TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_location_label TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS home_location_label TEXT',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS vendor_status TEXT',
+  ];
+  for (const sql of statements) {
+    await pool.query(sql);
+  }
+}
+
+function isAtLeast18(dateOfBirth) {
+  if (!dateOfBirth) return false;
+  const birth = new Date(`${dateOfBirth}T00:00:00`);
+  if (Number.isNaN(birth.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (birth >= today) return false;
+  const minAgeDate = new Date(today);
+  minAgeDate.setFullYear(minAgeDate.getFullYear() - 18);
+  return birth <= minAgeDate;
+}
+
+// POST - register shop/vendor (same rules as ZedMarket)
+router.post('/register-shop', requireAuth, async (req, res) => {
+  const {
+    name,
+    date_of_birth,
+    city,
+    province,
+    selling_type,
+    shop_name,
+    shop_address,
+    home_address,
+    shop_location_label,
+    home_location_label,
+    location_label,
+    business_bio,
+    business_photo_url,
+  } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'Full name is required.' });
+  }
+  if (!city || !city.trim() || !province) {
+    return res.status(400).json({ error: 'City and province are required.' });
+  }
+  if (!isAtLeast18(date_of_birth)) {
+    return res.status(400).json({ error: 'You must be at least 18 years old to register a shop.' });
+  }
+  if (!['shop', 'home', 'both'].includes(selling_type)) {
+    return res.status(400).json({ error: 'Please choose where you sell — shop, home, or both.' });
+  }
+  if ((selling_type === 'shop' || selling_type === 'both') && (!shop_name || !shop_address)) {
+    return res.status(400).json({ error: 'Please enter your shop name and shop address.' });
+  }
+  if ((selling_type === 'home' || selling_type === 'both') && !home_address) {
+    return res.status(400).json({ error: 'Please enter your home area or address.' });
+  }
+
+  const businessName =
+    (selling_type === 'home' ? null : shop_name) ||
+    shop_name ||
+    name.trim();
+
+  try {
+    await ensureVendorColumns();
+
+    await pool.query(
+      `UPDATE users SET
+         name = $1,
+         is_vendor = true,
+         vendor_status = 'pending',
+         business_name = $2,
+         business_bio = COALESCE($3, business_bio),
+         business_photo_url = COALESCE($4, business_photo_url),
+         date_of_birth = $5,
+         city = $6,
+         province = $7,
+         selling_type = $8,
+         shop_address = $9,
+         home_address = $10,
+         shop_location_label = $11,
+         home_location_label = $12
+       WHERE id = $13`,
+      [
+        name.trim(),
+        businessName.trim(),
+        business_bio || null,
+        business_photo_url || null,
+        date_of_birth,
+        city.trim(),
+        province,
+        selling_type,
+        shop_address || null,
+        home_address || null,
+        shop_location_label || location_label || null,
+        home_location_label || null,
+        req.userId,
+      ]
+    );
+
+    const userResult = await pool.query('SELECT referred_by FROM users WHERE id = $1', [req.userId]);
+    const referredBy = userResult.rows[0]?.referred_by;
+    if (referredBy) {
+      await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [referredBy]);
+      await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [req.userId]);
+    }
+
+    res.json({
+      success: true,
+      message: 'Submitted — your shop registration is under review. You can use the app while you wait.',
+      user: {
+        id: req.userId,
+        name: name.trim(),
+        is_vendor: true,
+        vendor_status: 'pending',
+        business_name: businessName.trim(),
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not submit shop registration.' });
+  }
+});
+
+// POST - become a vendor (legacy simple form — kept for old app builds)
 router.post('/become-vendor', requireAuth, async (req, res) => {
   const { business_name, business_bio, business_photo_url } = req.body;
 
@@ -407,8 +540,10 @@ router.post('/become-vendor', requireAuth, async (req, res) => {
   }
 
   try {
+    await ensureVendorColumns();
     await pool.query(
-      `UPDATE users SET is_vendor = true, business_name = $1, business_bio = $2, business_photo_url = $3 WHERE id = $4`,
+      `UPDATE users SET is_vendor = true, vendor_status = COALESCE(vendor_status, 'pending'),
+         business_name = $1, business_bio = $2, business_photo_url = $3 WHERE id = $4`,
       [business_name.trim(), business_bio || null, business_photo_url || null, req.userId]
     );
 
