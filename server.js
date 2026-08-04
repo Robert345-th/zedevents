@@ -101,7 +101,23 @@ async function sendDailyDigests() {
 
 cron.schedule('0 18 * * *', sendDailyDigests);
 
+async function ensureConfiguredAdmin() {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET is_admin = true
+       WHERE phone = '0978012009' OR phone = '260978012009' OR phone = '+260978012009'
+       RETURNING id, phone`
+    );
+    if (result.rows.length > 0) {
+      console.log(`Admin access enabled for ${result.rows[0].phone}.`);
+    }
+  } catch (err) {
+    console.error('Could not ensure admin user:', err);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  ensureConfiguredAdmin();
 });

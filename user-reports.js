@@ -29,9 +29,13 @@ router.post('/', requireAuth, async (req, res) => {
 router.get('/pending', requireAuth, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT ur.id, ur.reported_phone, ur.reason, ur.date, ur.status, u.name AS reporter_name
+      `SELECT ur.id, ur.reported_phone, ur.reason, ur.date, ur.status,
+              u.name AS reporter_name,
+              matched.id AS matched_user_id,
+              matched.is_suspended AS matched_user_suspended
        FROM user_reports ur
        LEFT JOIN users u ON ur.reported_by = u.id
+       LEFT JOIN users matched ON matched.phone = ur.reported_phone
        WHERE ur.status = 'pending'
        ORDER BY ur.date DESC`
     );

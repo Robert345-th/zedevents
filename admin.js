@@ -40,6 +40,125 @@ router.put('/users/:id/unsuspend', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
+// GET - vendor/shop applications waiting for approval
+router.get('/vendor-applications/pending', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, business_name, business_photo_url, business_bio,
+              date_of_birth, city, province, selling_type,
+              shop_address, home_address, shop_location_label, home_location_label,
+              date_joined
+       FROM users
+       WHERE vendor_status = 'pending'
+       ORDER BY date_joined ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load vendor applications.' });
+  }
+});
+
+// PUT - approve a vendor application
+router.put('/vendor-applications/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET vendor_status = 'approved' WHERE id = $1 AND vendor_status = 'pending' RETURNING id, name`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending vendor application not found.' });
+    }
+    sendPushNotification(
+      req.params.id,
+      'Shop Approved',
+      'Your ZedEvents vendor profile has been approved. You can now post services.'
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not approve vendor application.' });
+  }
+});
+
+// PUT - reject a vendor application
+router.put('/vendor-applications/:id/reject', requireAuth, requireAdmin, async (req, res) => {
+  const { reason } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE users SET vendor_status = 'rejected' WHERE id = $1 AND vendor_status = 'pending' RETURNING id`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending vendor application not found.' });
+    }
+    sendPushNotification(
+      req.params.id,
+      'Shop Application Declined',
+      reason?.trim()
+        ? `Your vendor application was not approved: ${reason.trim()}`
+        : 'Your vendor application could not be approved. Please contact support.'
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not reject vendor application.' });
+  }
+});
+
+// GET - services waiting for approval
+router.get('/services/pending', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.id, s.title, s.description, s.price, s.photos, s.status, s.date_posted,
+              c.name AS category, u.name AS vendor_name, u.business_name, u.phone AS vendor_phone
+       FROM services s
+       LEFT JOIN categories c ON s.category_id = c.id
+       LEFT JOIN users u ON s.vendor_id = u.id
+       WHERE s.status = 'pending'
+       ORDER BY s.date_posted ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load pending services.' });
+  }
+});
+
+// PUT - approve a service (makes it public)
+router.put('/services/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE services SET status = 'active' WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending service not found.' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not approve service.' });
+  }
+});
+
+// PUT - reject a service
+router.put('/services/:id/reject', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE services SET status = 'rejected' WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending service not found.' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not reject service.' });
+  }
+});
+
 // GET - pending service reports
 router.get('/reports/pending', requireAuth, requireAdmin, async (req, res) => {
   try {

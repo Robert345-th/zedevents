@@ -22,6 +22,27 @@ function toIntlPhone(phone) {
   return phone.startsWith('0') ? '+260' + phone.slice(1) : phone;
 }
 
+const ADMIN_PHONE = '0978012009';
+
+function normalizeLocalPhone(phone) {
+  if (!phone) return '';
+  let p = String(phone).trim().replace(/[\s-]/g, '');
+  if (p.startsWith('+')) p = p.slice(1);
+  if (p.startsWith('260')) p = '0' + p.slice(3);
+  return p;
+}
+
+function isAdminPhone(phone) {
+  return normalizeLocalPhone(phone) === ADMIN_PHONE;
+}
+
+async function ensureAdminFlag(user) {
+  if (!user || !isAdminPhone(user.phone) || user.is_admin) return user;
+  await pool.query('UPDATE users SET is_admin = true WHERE id = $1', [user.id]);
+  user.is_admin = true;
+  return user;
+}
+
 function generateReferralCodeCandidate() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -168,6 +189,8 @@ router.post('/verify-otp', async (req, res) => {
     }
 
     await pool.query('UPDATE users SET phone_verified = true, otp_code = NULL, otp_expires = NULL WHERE id = $1', [user.id]);
+
+    await ensureAdminFlag(user);
 
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
@@ -333,6 +356,8 @@ router.post('/login', async (req, res) => {
       user.referral_code = newCode;
     }
 
+    await ensureAdminFlag(user);
+
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({
@@ -342,6 +367,35 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong logging in.' });
+  }
+});
+
+// GET - current user session (refreshes admin flag for configured admin phone)
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, is_vendor, business_name, business_photo_url, is_admin
+       FROM users WHERE id = $1 AND (is_deleted = false OR is_deleted IS NULL)`,
+      [req.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const user = await ensureAdminFlag(result.rows[0]);
+    res.json({
+      id: user.id,
+      name: user.name,
+      phone: user.phone,
+      is_vendor: user.is_vendor,
+      business_name: user.business_name,
+      business_photo_url: user.business_photo_url,
+      is_admin: user.is_admin,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load account.' });
   }
 });
 

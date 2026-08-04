@@ -64,11 +64,11 @@ router.get('/mine', requireAuth, async (req, res) => {
   }
 });
 
-// GET - single service detail
+// GET - single service detail (public only sees approved/active)
 router.get('/:id', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT s.id, s.title, s.description, s.price, s.photos, s.date_posted, s.category_id, s.vendor_id,
+      `SELECT s.id, s.title, s.description, s.price, s.photos, s.status, s.date_posted, s.category_id, s.vendor_id,
               c.name AS category, u.name AS vendor_name, u.phone AS vendor_phone,
               u.business_name, u.business_bio, u.business_photo_url
        FROM services s
@@ -82,14 +82,30 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Service not found.' });
     }
 
-    res.json(result.rows[0]);
+    const service = result.rows[0];
+    if (service.status !== 'active') {
+      let viewerId = null;
+      const auth = req.headers.authorization;
+      if (auth && auth.startsWith('Bearer ')) {
+        try {
+          const jwt = require('jsonwebtoken');
+          const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
+          viewerId = decoded.userId;
+        } catch { /* ignore invalid token */ }
+      }
+      if (Number(viewerId) !== Number(service.vendor_id)) {
+        return res.status(404).json({ error: 'Service not found.' });
+      }
+    }
+
+    res.json(service);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load service.' });
   }
 });
 
-// POST - create a new service listing (must be a vendor). Free for now — no subscription required.
+// POST - create a new service listing (must be a vendor). Starts pending until admin approves.
 router.post('/', requireAuth, async (req, res) => {
   const { title, description, price, category_id, photos } = req.body;
 
@@ -98,15 +114,23 @@ router.post('/', requireAuth, async (req, res) => {
   }
 
   try {
-    const userCheck = await pool.query('SELECT is_vendor FROM users WHERE id = $1', [req.userId]);
+    const userCheck = await pool.query('SELECT is_vendor, vendor_status FROM users WHERE id = $1', [req.userId]);
 
     if (!userCheck.rows[0]?.is_vendor) {
       return res.status(403).json({ error: 'You need to set up a vendor profile before posting.', needsVendorProfile: true });
     }
 
+    const vendorStatus = userCheck.rows[0].vendor_status;
+    if (vendorStatus === 'pending') {
+      return res.status(403).json({ error: 'Your vendor profile is still under review.', vendorStatus: 'pending' });
+    }
+    if (vendorStatus === 'rejected') {
+      return res.status(403).json({ error: 'Your vendor application was not approved.', vendorStatus: 'rejected' });
+    }
+
     const result = await pool.query(
-      `INSERT INTO services (vendor_id, title, description, price, category_id, photos)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO services (vendor_id, title, description, price, category_id, photos, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
        RETURNING *`,
       [req.userId, title.trim(), description || null, price || null, category_id || null, photos || []]
     );
@@ -118,12 +142,12 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-// PUT - edit a service (owner only)
+// PUT - edit a service (owner only). Goes back to pending until re-approved.
 router.put('/:id', requireAuth, async (req, res) => {
   const { title, description, price, category_id, photos } = req.body;
 
   try {
-    const check = await pool.query('SELECT vendor_id FROM services WHERE id = $1', [req.params.id]);
+    const check = await pool.query('SELECT vendor_id, status FROM services WHERE id = $1', [req.params.id]);
 
     if (check.rows.length === 0) {
       return res.status(404).json({ error: 'Service not found.' });
@@ -133,9 +157,27 @@ router.put('/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'You can only edit your own services.' });
     }
 
+    if (check.rows[0].status === 'removed') {
+      return res.status(400).json({ error: 'This service was removed and cannot be edited.' });
+    }
+
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: 'Title is required.' });
+    }
+
     const result = await pool.query(
-      `UPDATE services SET title = $1, description = $2, price = $3, category_id = $4, photos = $5 WHERE id = $6 RETURNING *`,
-      [title, description, price, category_id, photos || [], req.params.id]
+      `UPDATE services
+       SET title = $1, description = $2, price = $3, category_id = $4, photos = $5, status = 'pending'
+       WHERE id = $6
+       RETURNING *`,
+      [
+        String(title).trim(),
+        description || null,
+        price || null,
+        category_id || null,
+        photos || [],
+        req.params.id,
+      ]
     );
 
     res.json(result.rows[0]);
