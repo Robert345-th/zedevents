@@ -103,6 +103,12 @@ cron.schedule('0 18 * * *', sendDailyDigests);
 
 async function ensureConfiguredAdmin() {
   try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false');
+  } catch (err) {
+    console.error('Could not ensure email columns:', err);
+  }
+  try {
     const result = await pool.query(
       `UPDATE users SET is_admin = true
        WHERE phone = '0978012009' OR phone = '260978012009' OR phone = '+260978012009'

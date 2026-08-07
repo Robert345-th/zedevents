@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -5,6 +6,11 @@ const africastalking = require('africastalking');
 const router = express.Router();
 const pool = require('./db');
 const requireAuth = require('./middleware');
+const {
+  resolveCountry,
+  normalizePhoneForCountry,
+  isValidPhoneForCountry,
+} = require('./countries');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -14,12 +20,95 @@ const AT = africastalking({
 });
 const smsService = AT.SMS;
 
+let authSchemaReady = false;
+
+async function ensureAuthSchema() {
+  if (authSchemaReady) return;
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS city TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS province TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_country TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_city TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_change_reason TEXT');
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS location_change_status TEXT');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email)) WHERE email IS NOT NULL'
+  );
+  try {
+    await pool.query('ALTER TABLE users ALTER COLUMN phone DROP NOT NULL');
+  } catch (_) {
+    /* older rows still have phones; email-only users may use placeholder */
+  }
+  authSchemaReady = true;
+}
+
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function normalizeEmail(email) {
+  return String(email || '')
+    .trim()
+    .toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email));
+}
+
+function isAtLeast18(dateOfBirth) {
+  if (!dateOfBirth) return false;
+  const birth = new Date(`${dateOfBirth}T00:00:00`);
+  if (Number.isNaN(birth.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (birth >= today) return false;
+  const minAgeDate = new Date(today);
+  minAgeDate.setFullYear(minAgeDate.getFullYear() - 18);
+  return birth <= minAgeDate;
+}
+
+/** E.164 for SMS. Keeps +country…; maps legacy Zambian 0… → +260… */
 function toIntlPhone(phone) {
-  return phone.startsWith('0') ? '+260' + phone.slice(1) : phone;
+  const raw = String(phone || '').trim().replace(/[\s-]/g, '');
+  if (!raw || raw.startsWith('e_')) return null;
+  if (raw.startsWith('+')) return raw;
+  if (raw.startsWith('00')) return '+' + raw.slice(2);
+  if (raw.startsWith('0') && raw.length >= 9 && raw.length <= 10) {
+    return '+260' + raw.slice(1);
+  }
+  if (/^\d{8,15}$/.test(raw)) return '+' + raw;
+  return raw;
+}
+
+function canSendSms(phone) {
+  return !!toIntlPhone(phone);
+}
+
+/** Stable placeholder when DB still requires phone NOT NULL */
+function emailPlaceholderPhone(email) {
+  const hash = crypto.createHash('sha256').update(normalizeEmail(email)).digest('hex').slice(0, 14);
+  return `e_${hash}`;
+}
+
+function publicUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    phone: user.phone && String(user.phone).startsWith('e_') ? null : user.phone,
+    email: user.email || null,
+    country: user.country || null,
+    city: user.city || null,
+    date_of_birth: user.date_of_birth || null,
+    location_change_status: user.location_change_status || null,
+    pending_country: user.pending_country || null,
+    is_admin: !!user.is_admin,
+    is_vendor: !!user.is_vendor,
+  };
 }
 
 const ADMIN_PHONE = '0978012009';
@@ -30,6 +119,29 @@ function normalizeLocalPhone(phone) {
   if (p.startsWith('+')) p = p.slice(1);
   if (p.startsWith('260')) p = '0' + p.slice(3);
   return p;
+}
+
+/** Normalize any phone to a storage form (prefer E.164 without + for intl, keep 0… for ZM). */
+function normalizePhoneInput(raw) {
+  let p = String(raw || '').trim().replace(/[\s-]/g, '');
+  if (!p) return '';
+  if (p.startsWith('e_')) return p;
+  if (p.startsWith('+')) p = p.slice(1);
+  if (p.startsWith('00')) p = p.slice(2);
+  // Zambia local
+  if (p.startsWith('260') && p.length === 12) return '0' + p.slice(3);
+  if (p.startsWith('0') && p.length >= 9 && p.length <= 10) return p;
+  // International without +: store with leading +
+  if (/^\d{8,15}$/.test(p)) return '+' + p;
+  return p;
+}
+
+function isValidPhoneInput(raw) {
+  const p = normalizePhoneInput(raw);
+  if (!p || p.startsWith('e_')) return false;
+  if (/^0(573\d{6}|574\d{6}|75\d{7}|77\d{7}|95\d{7}|97\d{7})$/.test(p)) return true;
+  if (/^\+\d{8,15}$/.test(p)) return true;
+  return false;
 }
 
 function isAdminPhone(phone) {
@@ -88,12 +200,163 @@ async function checkOtpLimit(userId) {
   return { allowed: true };
 }
 
-// SIGNUP - name, phone, password, and optional referral code
+// SIGNUP WITH EMAIL (Nexus / worldwide — no SMS required)
+router.post('/signup-email', async (req, res) => {
+  const { name, email, password, confirmPassword, referral_code, country, date_of_birth } = req.body;
+  const cleanEmail = normalizeEmail(email);
+  const countryInfo = resolveCountry(country);
+
+  if (!name || !cleanEmail || !password || !confirmPassword || !country || !date_of_birth) {
+    return res.status(400).json({ error: 'Name, email, password, country, and date of birth are required.' });
+  }
+  if (!isValidEmail(cleanEmail)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+  if (!countryInfo) {
+    return res.status(400).json({ error: 'Please select a valid country.' });
+  }
+  if (!isAtLeast18(date_of_birth)) {
+    return res.status(400).json({ error: 'You must be at least 18 years old to join Nexus.' });
+  }
+  if (password !== confirmPassword) {
+    return res.status(400).json({ error: 'Passwords do not match.' });
+  }
+  if (String(password).length < 8 || String(password).length > 72) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+
+  try {
+    await ensureAuthSchema();
+
+    let referrerId = null;
+    if (referral_code && referral_code.trim()) {
+      const referrerCheck = await pool.query('SELECT id FROM users WHERE referral_code = $1', [
+        referral_code.trim().toUpperCase(),
+      ]);
+      if (referrerCheck.rows.length === 0) {
+        return res.status(400).json({ error: 'That referral code was not found.' });
+      }
+      referrerId = referrerCheck.rows[0].id;
+    }
+
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email) = $1 AND (is_deleted = false OR is_deleted IS NULL)',
+      [cleanEmail]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'This email is already registered. Please log in.' });
+    }
+
+    const password_hash = await bcrypt.hash(password, 10);
+    const newReferralCode = await generateUniqueReferralCode();
+    const placeholderPhone = emailPlaceholderPhone(cleanEmail);
+
+    let user;
+    try {
+      const insertResult = await pool.query(
+        `INSERT INTO users (
+           name, phone, email, email_verified, phone_verified, password_hash,
+           referral_code, referred_by, country, province, date_of_birth
+         )
+         VALUES ($1, $2, $3, true, true, $4, $5, $6, $7, $7, $8)
+         RETURNING id, name, phone, email, country, city, date_of_birth, is_admin, is_vendor,
+                   location_change_status, pending_country`,
+        [
+          name.trim(),
+          placeholderPhone,
+          cleanEmail,
+          password_hash,
+          newReferralCode,
+          referrerId,
+          countryInfo.code,
+          date_of_birth,
+        ]
+      );
+      user = insertResult.rows[0];
+    } catch (insertErr) {
+      console.error('Email signup insert failed:', insertErr);
+      throw insertErr;
+    }
+
+    await ensureAdminFlag(user);
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+
+    res.status(201).json({
+      user: publicUser(user),
+      token,
+      message: 'Account created.',
+    });
+  } catch (err) {
+    console.error(err);
+    if (err.code === '23505') {
+      return res.status(400).json({ error: 'This email is already registered. Please log in.' });
+    }
+    res.status(500).json({ error: 'Something went wrong creating the account.' });
+  }
+});
+
+// LOGIN WITH EMAIL (or email field on /login below)
+router.post('/login-email', async (req, res) => {
+  const cleanEmail = normalizeEmail(req.body?.email);
+  const password = req.body?.password;
+
+  if (!cleanEmail || !password) {
+    return res.status(400).json({ error: 'Email and password are required.' });
+  }
+  if (!isValidEmail(cleanEmail)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+
+  try {
+    await ensureAuthSchema();
+    const result = await pool.query(
+      'SELECT * FROM users WHERE LOWER(email) = $1 AND (is_deleted = false OR is_deleted IS NULL)',
+      [cleanEmail]
+    );
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Email or password is incorrect.' });
+    }
+
+    const user = result.rows[0];
+    if (user.is_deleted) {
+      return res.status(400).json({ error: 'Email or password is incorrect.' });
+    }
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(400).json({ error: 'Email or password is incorrect.' });
+    }
+    if (user.is_suspended) {
+      return res.status(403).json({ error: 'Your account has been suspended. Contact support.' });
+    }
+
+    if (!user.referral_code) {
+      const newCode = await generateUniqueReferralCode();
+      await pool.query('UPDATE users SET referral_code = $1 WHERE id = $2', [newCode, user.id]);
+      user.referral_code = newCode;
+    }
+
+    await ensureAdminFlag(user);
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+
+    res.json({ user: publicUser(user), token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong logging in.' });
+  }
+});
+
+// SIGNUP - name, phone, password, and optional referral code (worldwide phones)
 router.post('/signup', async (req, res) => {
-  const { name, phone, password, confirmPassword, referral_code } = req.body;
+  const { name, password, confirmPassword, referral_code } = req.body;
+  const phone = normalizePhoneInput(req.body?.phone);
 
   if (!name || !phone || !password || !confirmPassword) {
     return res.status(400).json({ error: 'All fields are required.' });
+  }
+
+  if (!isValidPhoneInput(phone)) {
+    return res.status(400).json({ error: 'Please enter a valid phone number with country code (e.g. +260…).' });
   }
 
   if (password !== confirmPassword) {
@@ -101,6 +364,8 @@ router.post('/signup', async (req, res) => {
   }
 
   try {
+    await ensureAuthSchema();
+
     let referrerId = null;
     if (referral_code && referral_code.trim()) {
       const referrerCheck = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referral_code.trim().toUpperCase()]);
@@ -143,13 +408,16 @@ router.post('/signup', async (req, res) => {
       user = insertResult.rows[0];
     }
 
-    try {
-      await smsService.send({
-        to: [toIntlPhone(phone)],
-        message: `Your ZedEvents verification code is: ${otp}`,
-      });
-    } catch (smsErr) {
-      console.error('SMS send failed:', smsErr);
+    const intl = toIntlPhone(phone);
+    if (intl) {
+      try {
+        await smsService.send({
+          to: [intl],
+          message: `Your ZedEvents verification code is: ${otp}`,
+        });
+      } catch (smsErr) {
+        console.error('SMS send failed:', smsErr);
+      }
     }
 
     res.status(201).json({ user, message: 'Account created. Please verify with the OTP sent to your phone.' });
@@ -161,7 +429,8 @@ router.post('/signup', async (req, res) => {
 
 // VERIFY OTP
 router.post('/verify-otp', async (req, res) => {
-  const { phone, otp } = req.body;
+  const phone = normalizePhoneInput(req.body?.phone);
+  const { otp } = req.body;
 
   if (!phone || !otp) {
     return res.status(400).json({ error: 'Phone and OTP are required.' });
@@ -195,7 +464,7 @@ router.post('/verify-otp', async (req, res) => {
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({
-      user: { id: user.id, name: user.name, phone: user.phone, is_admin: user.is_admin, is_vendor: user.is_vendor },
+      user: publicUser(user),
       token,
     });
   } catch (err) {
@@ -206,7 +475,7 @@ router.post('/verify-otp', async (req, res) => {
 
 // RESEND OTP
 router.post('/resend-otp', async (req, res) => {
-  const { phone } = req.body;
+  const phone = normalizePhoneInput(req.body?.phone);
 
   try {
     const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
@@ -226,10 +495,13 @@ router.post('/resend-otp', async (req, res) => {
 
     await pool.query('UPDATE users SET otp_code = $1, otp_expires = $2 WHERE phone = $3', [otp, expires, phone]);
 
-    await smsService.send({
-      to: [toIntlPhone(phone)],
-      message: `Your ZedEvents verification code is: ${otp}`,
-    });
+    const intl = toIntlPhone(phone);
+    if (intl) {
+      await smsService.send({
+        to: [intl],
+        message: `Your ZedEvents verification code is: ${otp}`,
+      });
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -240,7 +512,7 @@ router.post('/resend-otp', async (req, res) => {
 
 // FORGOT PASSWORD
 router.post('/forgot-password', async (req, res) => {
-  const { phone } = req.body;
+  const phone = normalizePhoneInput(req.body?.phone);
 
   if (!phone) {
     return res.status(400).json({ error: 'Phone number is required.' });
@@ -265,10 +537,13 @@ router.post('/forgot-password', async (req, res) => {
 
     await pool.query('UPDATE users SET otp_code = $1, otp_expires = $2 WHERE phone = $3', [otp, expires, phone]);
 
-    await smsService.send({
-      to: [toIntlPhone(phone)],
-      message: `Your ZedEvents password reset code is: ${otp}`,
-    });
+    const intl = toIntlPhone(phone);
+    if (intl) {
+      await smsService.send({
+        to: [intl],
+        message: `Your ZedEvents password reset code is: ${otp}`,
+      });
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -279,7 +554,8 @@ router.post('/forgot-password', async (req, res) => {
 
 // RESET PASSWORD
 router.post('/reset-password', async (req, res) => {
-  const { phone, otp, newPassword, confirmNewPassword } = req.body;
+  const phone = normalizePhoneInput(req.body?.phone);
+  const { otp, newPassword, confirmNewPassword } = req.body;
 
   if (!phone || !otp || !newPassword || !confirmNewPassword) {
     return res.status(400).json({ error: 'All fields are required.' });
@@ -317,12 +593,49 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-// LOGIN
+// LOGIN — phone or email
 router.post('/login', async (req, res) => {
-  const { phone, password } = req.body;
+  const password = req.body?.password;
+  const email = normalizeEmail(req.body?.email);
+  const phone = normalizePhoneInput(req.body?.phone);
 
-  if (!phone || !password) {
-    return res.status(400).json({ error: 'Phone and password are required.' });
+  if ((!phone && !email) || !password) {
+    return res.status(400).json({ error: 'Email or phone, and password, are required.' });
+  }
+
+  // Prefer email path when provided
+  if (email) {
+    req.body.email = email;
+    // reuse login-email logic inline
+    try {
+      await ensureAuthSchema();
+      const result = await pool.query(
+        'SELECT * FROM users WHERE LOWER(email) = $1 AND (is_deleted = false OR is_deleted IS NULL)',
+        [email]
+      );
+      if (result.rows.length === 0) {
+        return res.status(400).json({ error: 'Email or password is incorrect.' });
+      }
+      const user = result.rows[0];
+      const match = await bcrypt.compare(password, user.password_hash);
+      if (!match) {
+        return res.status(400).json({ error: 'Email or password is incorrect.' });
+      }
+      if (user.is_suspended) {
+        return res.status(403).json({ error: 'Your account has been suspended. Contact support.' });
+      }
+      if (!user.referral_code) {
+        const newCode = await generateUniqueReferralCode();
+        await pool.query('UPDATE users SET referral_code = $1 WHERE id = $2', [newCode, user.id]);
+        user.referral_code = newCode;
+      }
+      await ensureAdminFlag(user);
+      const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+      return res.json({ user: publicUser(user), token });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: 'Something went wrong logging in.' });
+    }
   }
 
   try {
@@ -361,7 +674,7 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({
-      user: { id: user.id, name: user.name, phone: user.phone, is_admin: user.is_admin, is_vendor: user.is_vendor },
+      user: publicUser(user),
       token,
     });
   } catch (err) {
@@ -374,7 +687,8 @@ router.post('/login', async (req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, phone, is_vendor, business_name, business_photo_url, is_admin
+      `SELECT id, name, phone, email, country, city, date_of_birth, is_vendor, business_name, business_photo_url, is_admin,
+              location_change_status, pending_country, pending_city
        FROM users WHERE id = $1 AND (is_deleted = false OR is_deleted IS NULL)`,
       [req.userId]
     );
@@ -385,13 +699,9 @@ router.get('/me', requireAuth, async (req, res) => {
 
     const user = await ensureAdminFlag(result.rows[0]);
     res.json({
-      id: user.id,
-      name: user.name,
-      phone: user.phone,
-      is_vendor: user.is_vendor,
+      ...publicUser(user),
       business_name: user.business_name,
       business_photo_url: user.business_photo_url,
-      is_admin: user.is_admin,
     });
   } catch (err) {
     console.error(err);
@@ -452,12 +762,10 @@ router.get('/user-info/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Ensure shop-registration columns exist (same fields as ZedMarket register-shop).
+// Ensure shop-registration columns exist.
 async function ensureVendorColumns() {
+  await ensureAuthSchema();
   const statements = [
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE',
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS city TEXT',
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS province TEXT',
     'ALTER TABLE users ADD COLUMN IF NOT EXISTS selling_type TEXT',
     'ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_address TEXT',
     'ALTER TABLE users ADD COLUMN IF NOT EXISTS home_address TEXT',
@@ -470,25 +778,11 @@ async function ensureVendorColumns() {
   }
 }
 
-function isAtLeast18(dateOfBirth) {
-  if (!dateOfBirth) return false;
-  const birth = new Date(`${dateOfBirth}T00:00:00`);
-  if (Number.isNaN(birth.getTime())) return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  if (birth >= today) return false;
-  const minAgeDate = new Date(today);
-  minAgeDate.setFullYear(minAgeDate.getFullYear() - 18);
-  return birth <= minAgeDate;
-}
-
-// POST - register shop/vendor (same rules as ZedMarket)
+// POST - register shop (profile already has name, country, DOB from Nexus signup)
 router.post('/register-shop', requireAuth, async (req, res) => {
   const {
-    name,
-    date_of_birth,
+    phone,
     city,
-    province,
     selling_type,
     shop_name,
     shop_address,
@@ -500,58 +794,88 @@ router.post('/register-shop', requireAuth, async (req, res) => {
     business_photo_url,
   } = req.body;
 
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'Full name is required.' });
-  }
-  if (!city || !city.trim() || !province) {
-    return res.status(400).json({ error: 'City and province are required.' });
-  }
-  if (!isAtLeast18(date_of_birth)) {
-    return res.status(400).json({ error: 'You must be at least 18 years old to register a shop.' });
-  }
-  if (!['shop', 'home', 'both'].includes(selling_type)) {
-    return res.status(400).json({ error: 'Please choose where you sell — shop, home, or both.' });
-  }
-  if ((selling_type === 'shop' || selling_type === 'both') && (!shop_name || !shop_address)) {
-    return res.status(400).json({ error: 'Please enter your shop name and shop address.' });
-  }
-  if ((selling_type === 'home' || selling_type === 'both') && !home_address) {
-    return res.status(400).json({ error: 'Please enter your home area or address.' });
-  }
-
-  const businessName =
-    (selling_type === 'home' ? null : shop_name) ||
-    shop_name ||
-    name.trim();
-
   try {
     await ensureVendorColumns();
 
+    const profileResult = await pool.query(
+      `SELECT id, name, email, country, province, city, date_of_birth, phone, is_vendor, vendor_status
+       FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    if (profileResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+    const profile = profileResult.rows[0];
+    const countryCode = profile.country || profile.province;
+    if (!countryCode || !profile.date_of_birth) {
+      return res.status(400).json({
+        error: 'Finish your Nexus profile first (country and date of birth are required).',
+      });
+    }
+    if (!isAtLeast18(profile.date_of_birth)) {
+      return res.status(400).json({ error: 'You must be at least 18 years old to register a shop.' });
+    }
+
+    const normalizedPhone = normalizePhoneForCountry(phone, countryCode);
+    if (!normalizedPhone) {
+      const c = resolveCountry(countryCode);
+      return res.status(400).json({
+        error: c
+          ? `Enter a valid ${c.name} phone number (+${c.dial}…).`
+          : 'Enter a valid phone number for your registered country.',
+      });
+    }
+
+    // Prevent another account owning this phone
+    const phoneTaken = await pool.query(
+      `SELECT id FROM users WHERE phone = $1 AND id <> $2 AND (is_deleted = false OR is_deleted IS NULL)`,
+      [normalizedPhone, req.userId]
+    );
+    if (phoneTaken.rows.length > 0) {
+      return res.status(400).json({ error: 'That phone number is already used on another account.' });
+    }
+
+    if (!city || !String(city).trim()) {
+      return res.status(400).json({ error: 'City is required.' });
+    }
+    if (!['shop', 'home', 'both'].includes(selling_type)) {
+      return res.status(400).json({ error: 'Please choose where you sell — shop, home, or both.' });
+    }
+    if ((selling_type === 'shop' || selling_type === 'both') && (!shop_name || !shop_address)) {
+      return res.status(400).json({ error: 'Please enter your shop name and shop address.' });
+    }
+    if ((selling_type === 'home' || selling_type === 'both') && !home_address) {
+      return res.status(400).json({ error: 'Please enter your home area or address.' });
+    }
+
+    const businessName =
+      (selling_type === 'home' ? null : shop_name) ||
+      shop_name ||
+      profile.name;
+
     await pool.query(
       `UPDATE users SET
-         name = $1,
+         phone = $1,
+         phone_verified = true,
          is_vendor = true,
          vendor_status = 'pending',
          business_name = $2,
          business_bio = COALESCE($3, business_bio),
          business_photo_url = COALESCE($4, business_photo_url),
-         date_of_birth = $5,
-         city = $6,
-         province = $7,
-         selling_type = $8,
-         shop_address = $9,
-         home_address = $10,
-         shop_location_label = $11,
-         home_location_label = $12
-       WHERE id = $13`,
+         city = $5,
+         province = COALESCE(country, province),
+         selling_type = $6,
+         shop_address = $7,
+         home_address = $8,
+         shop_location_label = $9,
+         home_location_label = $10
+       WHERE id = $11`,
       [
-        name.trim(),
+        normalizedPhone,
         businessName.trim(),
         business_bio || null,
         business_photo_url || null,
-        date_of_birth,
-        city.trim(),
-        province,
+        String(city).trim(),
         selling_type,
         shop_address || null,
         home_address || null,
@@ -561,8 +885,14 @@ router.post('/register-shop', requireAuth, async (req, res) => {
       ]
     );
 
-    const userResult = await pool.query('SELECT referred_by FROM users WHERE id = $1', [req.userId]);
-    const referredBy = userResult.rows[0]?.referred_by;
+    const userResult = await pool.query(
+      `SELECT id, name, phone, email, country, city, date_of_birth, is_admin, is_vendor,
+              location_change_status, pending_country, referred_by
+       FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    const user = userResult.rows[0];
+    const referredBy = user?.referred_by;
     if (referredBy) {
       await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [referredBy]);
       await pool.query('UPDATE users SET free_featured_credits = free_featured_credits + 1 WHERE id = $1', [req.userId]);
@@ -572,9 +902,7 @@ router.post('/register-shop', requireAuth, async (req, res) => {
       success: true,
       message: 'Submitted — your shop registration is under review. You can use the app while you wait.',
       user: {
-        id: req.userId,
-        name: name.trim(),
-        is_vendor: true,
+        ...publicUser(user),
         vendor_status: 'pending',
         business_name: businessName.trim(),
       },
@@ -582,6 +910,77 @@ router.post('/register-shop', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not submit shop registration.' });
+  }
+});
+
+// POST - request country/location change (requires admin approval; cannot change freely)
+router.post('/request-location-change', requireAuth, async (req, res) => {
+  const countryInfo = resolveCountry(req.body?.country);
+  const city = String(req.body?.city || '').trim();
+  const reason = String(req.body?.reason || '').trim().slice(0, 500);
+
+  if (!countryInfo) {
+    return res.status(400).json({ error: 'Please choose a valid new country.' });
+  }
+  if (!city) {
+    return res.status(400).json({ error: 'Please enter your new city.' });
+  }
+  if (!reason || reason.length < 8) {
+    return res.status(400).json({ error: 'Please explain why you moved (at least a short reason).' });
+  }
+
+  try {
+    await ensureAuthSchema();
+    const current = await pool.query(
+      'SELECT country, city, location_change_status FROM users WHERE id = $1',
+      [req.userId]
+    );
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+    if (current.rows[0].location_change_status === 'pending') {
+      return res.status(400).json({ error: 'You already have a location change waiting for approval.' });
+    }
+    if (current.rows[0].country === countryInfo.code && (current.rows[0].city || '') === city) {
+      return res.status(400).json({ error: 'That is already your current location.' });
+    }
+
+    await pool.query(
+      `UPDATE users SET
+         pending_country = $1,
+         pending_city = $2,
+         location_change_reason = $3,
+         location_change_status = 'pending'
+       WHERE id = $4`,
+      [countryInfo.code, city, reason, req.userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Request submitted. An admin must approve before your country/location changes.',
+      location_change_status: 'pending',
+      pending_country: countryInfo.code,
+      pending_city: city,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not submit location change request.' });
+  }
+});
+
+// GET - my location change request status
+router.get('/location-change', requireAuth, async (req, res) => {
+  try {
+    await ensureAuthSchema();
+    const result = await pool.query(
+      `SELECT country, city, pending_country, pending_city, location_change_reason, location_change_status
+       FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    res.json(result.rows[0] || {});
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load location change status.' });
   }
 });
 

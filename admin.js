@@ -212,4 +212,82 @@ router.post('/broadcast', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// GET - pending country/location change requests
+router.get('/location-changes/pending', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email, phone, country, city, pending_country, pending_city,
+              location_change_reason, location_change_status
+       FROM users
+       WHERE location_change_status = 'pending'
+       ORDER BY id ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load location change requests.' });
+  }
+});
+
+// PUT - approve location change (applies pending country/city; phone must be updated later for new country)
+router.put('/location-changes/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET
+         country = pending_country,
+         province = pending_country,
+         city = pending_city,
+         pending_country = NULL,
+         pending_city = NULL,
+         location_change_reason = NULL,
+         location_change_status = 'approved'
+       WHERE id = $1 AND location_change_status = 'pending'
+       RETURNING id, name, country, city`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending location change not found.' });
+    }
+    sendPushNotification(
+      req.params.id,
+      'Location updated',
+      'Your country/location change was approved. Update your shop phone if needed for the new country.'
+    );
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not approve location change.' });
+  }
+});
+
+// PUT - reject location change
+router.put('/location-changes/:id/reject', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE users SET
+         pending_country = NULL,
+         pending_city = NULL,
+         location_change_reason = NULL,
+         location_change_status = 'rejected'
+       WHERE id = $1 AND location_change_status = 'pending'
+       RETURNING id`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending location change not found.' });
+    }
+    sendPushNotification(
+      req.params.id,
+      'Location change declined',
+      req.body?.reason?.trim()
+        ? `Your location change was not approved: ${req.body.reason.trim()}`
+        : 'Your location change request was not approved.'
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not reject location change.' });
+  }
+});
+
 module.exports = router;
